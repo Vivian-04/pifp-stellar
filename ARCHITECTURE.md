@@ -24,6 +24,8 @@
 
 PIFP replaces trust-based donations with **cryptographic accountability**. Funds are locked inside a Soroban smart contract and can only be released when a designated Oracle submits a proof hash that matches the one registered at project creation.
 
+> *For detailed function signatures, parameters, and CLI examples, please see the [Smart Contract API Reference](./docs/contract_api.md).*
+
 ```
 ┌──────────────┐     register_project     ┌─────────────────────────┐
 │ ProjectManager│ ───────────────────────► │                         │
@@ -67,6 +69,8 @@ contracts/pifp_protocol/src/
 ├── test_errors.rs — Comprehensive error-path tests
 └── fuzz_test.rs  — Property-based fuzz tests (proptest)
 ```
+
+> *For detailed function signatures, parameters, and CLI examples for `lib.rs`, please see the [Smart Contract API Reference](./docs/contract_api.md).*
 
 ### `lib.rs` — Contract Interface
 
