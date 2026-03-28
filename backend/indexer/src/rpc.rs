@@ -660,12 +660,13 @@ mod tests {
                 let first_topic = r.topic.first()?;
                 let kind = EventKind::from_topic(&extract_symbol(first_topic));
                 let project_id = r.topic.get(1).map(|t| extract_u64_or_raw(t));
-                let (actor, amount) = decode_data(&r.value, &kind);
+                let (actor, amount, extra_data) = decode_data(&r.value, &kind);
                 Some(PifpEvent {
                     event_type: kind.as_str().to_string(),
                     project_id,
                     actor,
                     amount,
+                    extra_data,
                     ledger: r.ledger.unwrap_or(0) as i64,
                     timestamp: r
                         .ledger_closed_at
