@@ -55,6 +55,63 @@ pub struct ProtocolConfigUpdated {
     pub new_fee_bps: u32,
 }
 
+use soroban_sdk::{contracttype, symbol_short, Address, BytesN, Env};
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectCreated {
+    pub project_id: u64,
+    pub creator: Address,
+    pub token: Address,
+    pub goal: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectFunded {
+    pub project_id: u64,
+    pub donator: Address,
+    pub amount: i128,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectActive {
+    pub project_id: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectVerified {
+    pub project_id: u64,
+    pub oracle: Address,
+    pub proof_hash: BytesN<32>,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProjectExpired {
+    pub project_id: u64,
+    pub deadline: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeadlineExtended {
+    pub project_id: u64,
+    pub old_deadline: u64,
+    pub new_deadline: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ProtocolConfigUpdated {
+    pub old_fee_recipient: Option<Address>,
+    pub old_fee_bps: u32,
+    pub new_fee_recipient: Address,
+    pub new_fee_bps: u32,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct FeeDeducted {
@@ -62,6 +119,20 @@ pub struct FeeDeducted {
     pub token: Address,
     pub amount: i128,
     pub recipient: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WhitelistAdded {
+    pub project_id: u64,
+    pub address: Address,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WhitelistRemoved {
+    pub project_id: u64,
+    pub address: Address,
 }
 
 #[contracttype]
@@ -185,6 +256,24 @@ pub fn emit_fee_deducted(env: &Env, project_id: u64, token: Address, amount: i12
         token,
         amount,
         recipient,
+    };
+    env.events().publish(topics, data);
+}
+
+pub fn emit_whitelist_added(env: &Env, project_id: u64, address: Address) {
+    let topics = (symbol_short!("wl_add"), project_id);
+    let data = WhitelistAdded {
+        project_id,
+        address,
+    };
+    env.events().publish(topics, data);
+}
+
+pub fn emit_whitelist_removed(env: &Env, project_id: u64, address: Address) {
+    let topics = (symbol_short!("wl_rem"), project_id);
+    let data = WhitelistRemoved {
+        project_id,
+        address,
     };
     env.events().publish(topics, data);
 }

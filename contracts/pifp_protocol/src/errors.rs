@@ -116,4 +116,6 @@ pub enum Error {
     DeadlineTooLong = 24,
     /// Fee basis points exceed the maximum allowed (10%).
     InvalidFeeBasisPoints = 25,
+    /// Address is not on the project's whitelist.
+    NotWhitelisted = 26,
 }

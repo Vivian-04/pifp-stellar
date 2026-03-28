@@ -56,6 +56,7 @@ pub struct ProjectConfig {
     pub goal: i128,
     pub proof_hash: BytesN<32>,
     pub deadline: u64,
+    pub is_private: bool,
 }
 
 /// Mutable project state, updated on deposits and verification.
@@ -96,6 +97,8 @@ pub struct Project {
     /// Count of unique (token, donator) pairs that have donated.
     /// Informational; incremented on each new deposit.
     pub donation_count: u32,
+    /// Is this a private project (whitelist only)?
+    pub is_private: bool,
 }
 
 impl Project {

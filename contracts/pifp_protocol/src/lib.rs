@@ -60,14 +60,17 @@ mod test_deadline;
 mod test_errors;
 #[cfg(test)]
 mod test_protocol_config;
+#[cfg(test)]
+mod test_whitelist;
 
 pub use errors::Error;
 pub use events::emit_funds_released;
 pub use rbac::Role;
 use storage::{
-    drain_token_balance, get_all_balances, get_and_increment_project_id, get_protocol_config,
-    load_project, load_project_pair, maybe_load_project, save_project, save_project_config,
-    save_project_state, set_protocol_config,
+    add_to_whitelist, drain_token_balance, get_all_balances, get_and_increment_project_id,
+    get_protocol_config, is_whitelisted, load_project, load_project_pair, maybe_load_project,
+    remove_from_whitelist, save_project, save_project_config, save_project_state,
+    set_protocol_config,
 };
 pub use types::{Project, ProjectBalances, ProjectConfig, ProjectState, ProtocolConfig};
 
@@ -174,6 +177,7 @@ impl PifpProtocol {
         goal: i128,
         proof_hash: BytesN<32>,
         deadline: u64,
+        is_private: bool,
     ) -> Project {
         Self::require_not_paused(&env);
         creator.require_auth();
@@ -217,6 +221,7 @@ impl PifpProtocol {
             deadline,
             status: ProjectStatus::Funding,
             donation_count: 0,
+            is_private,
         };
 
         save_project(&env, &project);
@@ -274,6 +279,38 @@ impl PifpProtocol {
         events::emit_deadline_extended(&env, project_id, old_deadline, new_deadline);
     }
 
+    /// Add an address to a project's whitelist.
+    ///
+    /// - `caller` must be the project creator or an Admin.
+    pub fn add_to_whitelist(env: Env, caller: Address, project_id: u64, address: Address) {
+        caller.require_auth();
+        let config = storage::load_project_config(&env, project_id);
+        
+        // Auth check: creator or Admin/SuperAdmin
+        if caller != config.creator {
+            rbac::require_admin_or_above(&env, &caller);
+        }
+
+        storage::add_to_whitelist(&env, project_id, &address);
+        events::emit_whitelist_added(&env, project_id, address);
+    }
+
+    /// Remove an address from a project's whitelist.
+    ///
+    /// - `caller` must be the project creator or an Admin.
+    pub fn remove_from_whitelist(env: Env, caller: Address, project_id: u64, address: Address) {
+        caller.require_auth();
+        let config = storage::load_project_config(&env, project_id);
+        
+        // Auth check: creator or Admin/SuperAdmin
+        if caller != config.creator {
+            rbac::require_admin_or_above(&env, &caller);
+        }
+
+        storage::remove_from_whitelist(&env, project_id, &address);
+        events::emit_whitelist_removed(&env, project_id, address);
+    }
+
     pub fn get_project(env: Env, id: u64) -> Project {
         load_project(&env, id)
     }
@@ -321,6 +358,13 @@ impl PifpProtocol {
                 save_project_state(&env, project_id, &state);
             }
             panic_with_error!(&env, Error::ProjectExpired);
+        }
+
+        // Whitelist check
+        if config.is_private {
+            if !is_whitelisted(&env, project_id, &donator) {
+                panic_with_error!(&env, Error::NotWhitelisted);
+            }
         }
 
         // Basic status check: must be Funding or Active.
