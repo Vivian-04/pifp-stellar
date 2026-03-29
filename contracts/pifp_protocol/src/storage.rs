@@ -31,7 +31,9 @@
 use soroban_sdk::{contracttype, panic_with_error, Address, Env, Vec};
 
 use crate::errors::Error;
-use crate::types::{Project, ProjectBalances, ProjectConfig, ProjectState, TokenBalance};
+use crate::types::{
+    Project, ProjectBalances, ProjectConfig, ProjectState, ProtocolConfig, TokenBalance,
+};
 
 // ── TTL Constants ────────────────────────────────────────────────────
 
@@ -68,6 +70,10 @@ pub enum DataKey {
     IsPaused,
     /// Per-donator refundable balance keyed by (project_id, token, donator) (Persistent).
     DonatorBalance(u64, Address, Address),
+    /// Global protocol configuration (Instance).
+    ProtocolConfig,
+    /// Whitelisted donator for a project (Persistent).
+    Whitelist(u64, Address),
 }
 
 // ── Instance Storage Helpers ─────────────────────────────────────────
@@ -112,6 +118,17 @@ pub fn set_paused(env: &Env, paused: bool) {
     env.storage().instance().set(&DataKey::IsPaused, &paused);
 }
 
+/// Retrieve the global protocol configuration.
+pub fn get_protocol_config(env: &Env) -> Option<ProtocolConfig> {
+    env.storage().instance().get(&DataKey::ProtocolConfig)
+}
+
+/// Save the global protocol configuration.
+pub fn set_protocol_config(env: &Env, config: &ProtocolConfig) {
+    bump_instance(env);
+    env.storage().instance().set(&DataKey::ProtocolConfig, config);
+}
+
 // ── Persistent Storage Helpers ───────────────────────────────────────
 
 /// Extend the TTL for a persistent storage key.
@@ -135,11 +152,14 @@ pub fn save_project(env: &Env, project: &Project) {
         goal: project.goal,
         proof_hash: project.proof_hash.clone(),
         deadline: project.deadline,
+        is_private: project.is_private,
+        metadata_uri: project.metadata_uri.clone(),
     };
 
     let state = ProjectState {
         status: project.status.clone(),
         donation_count: project.donation_count,
+        refund_expiry: project.refund_expiry,
     };
 
     env.storage().persistent().set(&config_key, &config);
@@ -269,9 +289,12 @@ pub fn load_project(env: &Env, id: u64) -> Project {
         accepted_tokens: config.accepted_tokens,
         goal: config.goal,
         proof_hash: config.proof_hash,
+        metadata_uri: config.metadata_uri,
         deadline: config.deadline,
         status: state.status,
         donation_count: state.donation_count,
+        is_private: config.is_private,
+        refund_expiry: state.refund_expiry,
     }
 }
 
@@ -286,8 +309,9 @@ pub fn maybe_load_project(env: &Env, id: u64) -> Option<Project> {
         Some(c) => c,
         None => return None,
     };
-    
-    // If config exists, state must exist. This maintains the invariant while avoiding 
+    let config = maybe_load_project_config(env, id)?;
+
+    // If config exists, state must exist. This maintains the invariant while avoiding
     // a redundant .has() check before .get().
     let state: ProjectState = env
         .storage()
@@ -301,9 +325,12 @@ pub fn maybe_load_project(env: &Env, id: u64) -> Option<Project> {
         accepted_tokens: config.accepted_tokens,
         goal: config.goal,
         proof_hash: config.proof_hash,
+        metadata_uri: config.metadata_uri,
         deadline: config.deadline,
         status: state.status,
         donation_count: state.donation_count,
+        is_private: config.is_private,
+        refund_expiry: state.refund_expiry,
     })
 }
 
@@ -394,6 +421,7 @@ pub fn set_donator_balance(
 }
 
 /// Add `amount` to a donator's contributed balance for (project_id, token).
+#[allow(dead_code)]
 pub fn add_to_donator_balance(
     env: &Env,
     project_id: u64,
@@ -408,4 +436,27 @@ pub fn add_to_donator_balance(
     };
     set_donator_balance(env, project_id, token, donator, new_balance);
     new_balance
+}
+
+/// Return true if `address` is on the whitelist for `project_id`.
+pub fn is_whitelisted(env: &Env, project_id: u64, address: &Address) -> bool {
+    let key = DataKey::Whitelist(project_id, address.clone());
+    let exists = env.storage().persistent().has(&key);
+    if exists {
+        bump_persistent(env, &key);
+    }
+    exists
+}
+
+/// Add `address` to the whitelist for `project_id`.
+pub fn add_to_whitelist(env: &Env, project_id: u64, address: &Address) {
+    let key = DataKey::Whitelist(project_id, address.clone());
+    env.storage().persistent().set(&key, &());
+    bump_persistent(env, &key);
+}
+
+/// Remove `address` from the whitelist for `project_id`.
+pub fn remove_from_whitelist(env: &Env, project_id: u64, address: &Address) {
+    let key = DataKey::Whitelist(project_id, address.clone());
+    env.storage().persistent().remove(&key);
 }

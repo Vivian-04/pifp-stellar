@@ -25,20 +25,25 @@
 
 #![no_std]
 
-use soroban_sdk::{
-    contract, contractimpl, panic_with_error, token, Address, BytesN, Env, Vec,
-};
+use soroban_sdk::{contract, contractimpl, panic_with_error, token, Address, Bytes, BytesN, Env, Vec};
+
+/// Refund window: 6 months (in seconds) after a project enters a terminal
+/// refundable state (Expired or Cancelled).  Donors must claim refunds within
+/// this window; after it passes, the creator may reclaim unclaimed funds.
+const REFUND_WINDOW: u64 = 6 * 30 * 24 * 60 * 60; // 15_552_000 seconds
+
+/// Maximum allowed length for a project metadata URI / CID.
+const MAX_METADATA_URI_LEN: u32 = 64;
 
 pub mod errors;
 pub mod events;
+pub mod invariants_checker;
 pub mod rbac;
 mod storage;
 mod types;
 
 #[cfg(test)]
 mod fuzz_test;
-#[cfg(test)]
-mod invariants;
 #[cfg(test)]
 mod rbac_test;
 
@@ -47,17 +52,28 @@ mod test;
 #[cfg(test)]
 mod test_donation_count;
 #[cfg(test)]
+mod test_errors;
+#[cfg(test)]
 mod test_events;
 #[cfg(test)]
 mod test_expire;
 #[cfg(test)]
 mod test_refund;
 #[cfg(test)]
-mod test_utils;
+mod test_reclaim;
+#[cfg(test)]
+mod test_deadline;
+#[cfg(test)]
+mod test_deadline;
 #[cfg(test)]
 mod test_deadline;
 #[cfg(test)]
 mod test_errors;
+#[cfg(test)]
+mod test_protocol_config;
+#[cfg(test)]
+mod test_whitelist;
+mod test_utils;
 
 pub use errors::Error;
 pub use events::emit_funds_released;
@@ -65,10 +81,19 @@ pub use rbac::Role;
 use storage::{
     drain_token_balance, get_all_balances, get_and_increment_project_id, load_project,
     load_project_pair, maybe_load_project, save_project, save_project_config, save_project_state,
+    drain_token_balance, get_all_balances, get_and_increment_project_id, get_protocol_config,
+    load_project, load_project_pair, maybe_load_project, save_project, save_project_config,
+    save_project_state, set_protocol_config,
 };
-pub use types::{Project, ProjectBalances, ProjectStatus};
+pub use types::{Project, ProjectBalances, ProjectConfig, ProjectState, ProtocolConfig};
 
 
+    add_to_whitelist, drain_token_balance, get_all_balances, get_and_increment_project_id,
+    get_protocol_config, is_whitelisted, load_project, load_project_pair, maybe_load_project,
+    remove_from_whitelist, save_project, save_project_config, save_project_state,
+    set_protocol_config,
+};
+pub use types::{Project, ProjectBalances, ProjectConfig, ProjectState, ProtocolConfig};
 
 #[contract]
 pub struct PifpProtocol;
@@ -170,7 +195,9 @@ impl PifpProtocol {
         accepted_tokens: Vec<Address>,
         goal: i128,
         proof_hash: BytesN<32>,
+        metadata_uri: Bytes,
         deadline: u64,
+        is_private: bool,
     ) -> Project {
         Self::require_not_paused(&env);
         creator.require_auth();
@@ -198,6 +225,11 @@ impl PifpProtocol {
         }
 
         let now = env.ledger().timestamp();
+        // Metadata must be non-empty and fit within the supported CID/URI length.
+        if metadata_uri.is_empty() || metadata_uri.len() > MAX_METADATA_URI_LEN {
+            panic_with_error!(&env, Error::MetadataCidInvalid);
+        }
+
         // Max 5 years deadline (5 * 365 * 24 * 60 * 60)
         let max_deadline = now + 157_680_000;
         if deadline <= now || deadline > max_deadline {
@@ -211,9 +243,12 @@ impl PifpProtocol {
             accepted_tokens: accepted_tokens.clone(),
             goal,
             proof_hash,
+            metadata_uri: metadata_uri.clone(),
             deadline,
             status: ProjectStatus::Funding,
             donation_count: 0,
+            is_private,
+            refund_expiry: 0,
         };
 
         save_project(&env, &project);
@@ -271,8 +306,46 @@ impl PifpProtocol {
         events::emit_deadline_extended(&env, project_id, old_deadline, new_deadline);
     }
 
+    /// Add an address to a project's whitelist.
+    ///
+    /// - `caller` must be the project creator or an Admin.
+    pub fn add_to_whitelist(env: Env, caller: Address, project_id: u64, address: Address) {
+        caller.require_auth();
+        let config = storage::load_project_config(&env, project_id);
+        
+        // Auth check: creator or Admin/SuperAdmin
+        if caller != config.creator {
+            rbac::require_admin_or_above(&env, &caller);
+        }
+
+        storage::add_to_whitelist(&env, project_id, &address);
+        events::emit_whitelist_added(&env, project_id, address);
+    }
+
+    /// Remove an address from a project's whitelist.
+    ///
+    /// - `caller` must be the project creator or an Admin.
+    pub fn remove_from_whitelist(env: Env, caller: Address, project_id: u64, address: Address) {
+        caller.require_auth();
+        let config = storage::load_project_config(&env, project_id);
+        
+        // Auth check: creator or Admin/SuperAdmin
+        if caller != config.creator {
+            rbac::require_admin_or_above(&env, &caller);
+        }
+
+        storage::remove_from_whitelist(&env, project_id, &address);
+        events::emit_whitelist_removed(&env, project_id, address);
+    }
+
     pub fn get_project(env: Env, id: u64) -> Project {
         load_project(&env, id)
+    }
+
+    /// Return the immutable metadata URI attached to a project.
+    pub fn get_project_metadata(env: Env, project_id: u64) -> Bytes {
+        let config = storage::load_project_config(&env, project_id);
+        config.metadata_uri
     }
 
     /// Return the balance of `token` for `project_id`.
@@ -315,9 +388,17 @@ impl PifpProtocol {
         if env.ledger().timestamp() >= config.deadline {
             if matches!(state.status, ProjectStatus::Funding | ProjectStatus::Active) {
                 state.status = ProjectStatus::Expired;
+                state.refund_expiry = env.ledger().timestamp() + REFUND_WINDOW;
                 save_project_state(&env, project_id, &state);
             }
             panic_with_error!(&env, Error::ProjectExpired);
+        }
+
+        // Whitelist check
+        if config.is_private {
+            if !is_whitelisted(&env, project_id, &donator) {
+                panic_with_error!(&env, Error::NotWhitelisted);
+            }
         }
 
         // Basic status check: must be Funding or Active.
@@ -341,9 +422,10 @@ impl PifpProtocol {
 
         // Check if this is a new unique (donator, token) pair.
         // A donator balance of 0 implicitly proves they have not donated yet, saving a storage key entirely.
-        let current_donor_balance = storage::get_donator_balance(&env, project_id, &token, &donator);
+        let current_donor_balance =
+            storage::get_donator_balance(&env, project_id, &token, &donator);
         let is_new_donor = current_donor_balance == 0;
-        
+
         if is_new_donor {
             // Increment donation count
             state.donation_count += 1;
@@ -353,7 +435,7 @@ impl PifpProtocol {
 
         // Transfer tokens from donator to contract.
         let token_client = token::Client::new(&env, &token);
-        token_client.transfer(&donator, &env.current_contract_address(), &amount);
+        token_client.transfer(&donator, env.current_contract_address(), &amount);
 
         // Update the per-token balance.
         let new_balance = storage::add_to_token_balance(&env, project_id, &token, amount);
@@ -370,14 +452,56 @@ impl PifpProtocol {
         }
 
         // Track per-donator refundable amount for this token.
-        let new_donor_balance = current_donor_balance.checked_add(amount).expect("donator balance overflow");
+        let new_donor_balance = current_donor_balance
+            .checked_add(amount)
+            .expect("donator balance overflow");
         storage::set_donator_balance(&env, project_id, &token, &donator, new_donor_balance);
 
         // Standardized event emission
         events::emit_project_funded(&env, project_id, donator, amount);
     }
 
-    /// Refund a donator from an expired project that was not verified.
+    /// Mark an active project as cancelled.
+    ///
+    /// - `caller` must be `SuperAdmin` or `ProjectManager`.
+    /// - If `caller` is `ProjectManager`, it must be the project's creator.
+    /// - Only projects in `Active` status may be cancelled.
+    pub fn cancel_project(env: Env, caller: Address, project_id: u64) {
+        caller.require_auth();
+        rbac::require_can_cancel_project(&env, &caller);
+
+        let (config, mut state) = load_project_pair(&env, project_id);
+
+        if env.ledger().timestamp() >= config.deadline
+            && matches!(state.status, ProjectStatus::Funding | ProjectStatus::Active)
+        {
+            state.status = ProjectStatus::Expired;
+            state.refund_expiry = env.ledger().timestamp() + REFUND_WINDOW;
+            save_project_state(&env, project_id, &state);
+            panic_with_error!(&env, Error::ProjectExpired);
+        }
+
+        if matches!(rbac::get_role(&env, &caller), Some(Role::ProjectManager))
+            && caller != config.creator
+        {
+            panic_with_error!(&env, Error::NotAuthorized);
+        }
+
+        if state.status != ProjectStatus::Active {
+            panic_with_error!(&env, Error::InvalidTransition);
+        }
+
+        state.status = ProjectStatus::Cancelled;
+        state.refund_expiry = env.ledger().timestamp() + REFUND_WINDOW;
+        save_project_state(&env, project_id, &state);
+        events::emit_project_cancelled(&env, project_id, caller);
+    }
+
+    /// Refund a donator from a cancelled or expired project that was not verified.
+    ///
+    /// Donors must claim their refund within the 6-month refund window.
+    /// After the window expires, only the creator may reclaim unclaimed funds
+    /// via [`reclaim_expired_funds`].
     pub fn refund(env: Env, donator: Address, project_id: u64, token: Address) {
         donator.require_auth();
 
@@ -387,11 +511,20 @@ impl PifpProtocol {
             && matches!(state.status, ProjectStatus::Funding | ProjectStatus::Active)
         {
             state.status = ProjectStatus::Expired;
+            state.refund_expiry = env.ledger().timestamp() + REFUND_WINDOW;
             save_project_state(&env, project_id, &state);
         }
 
-        if state.status != ProjectStatus::Expired {
+        if !matches!(
+            state.status,
+            ProjectStatus::Expired | ProjectStatus::Cancelled
+        ) {
             panic_with_error!(&env, Error::ProjectNotExpired);
+        }
+
+        // Block refunds after the refund window has expired.
+        if state.refund_expiry > 0 && env.ledger().timestamp() >= state.refund_expiry {
+            panic_with_error!(&env, Error::RefundWindowExpired);
         }
 
         let refund_amount = storage::get_donator_balance(&env, project_id, &token, &donator);
@@ -418,6 +551,29 @@ impl PifpProtocol {
         caller.require_auth();
         rbac::require_admin_or_above(&env, &caller);
         rbac::grant_role(&env, &caller, &oracle, Role::Oracle);
+    }
+
+    /// Update the global protocol configuration.
+    ///
+    /// - `caller` must be the `SuperAdmin`.
+    /// - `fee_bps` must be less than or equal to 1000 (10%).
+    pub fn update_protocol_config(env: Env, caller: Address, fee_recipient: Address, fee_bps: u32) {
+        caller.require_auth();
+        rbac::require_super_admin(&env, &caller);
+
+        if fee_bps > 1000 {
+            panic_with_error!(&env, Error::InvalidFeeBasisPoints);
+        }
+
+        let old_config = get_protocol_config(&env);
+        let new_config = ProtocolConfig {
+            fee_recipient,
+            fee_bps,
+        };
+
+        set_protocol_config(&env, &new_config);
+
+        events::emit_protocol_config_updated(&env, old_config, new_config);
     }
 
     /// Verify proof of impact and release funds to the creator.
@@ -448,6 +604,7 @@ impl PifpProtocol {
             && matches!(state.status, ProjectStatus::Funding | ProjectStatus::Active)
         {
             state.status = ProjectStatus::Expired;
+            state.refund_expiry = env.ledger().timestamp() + REFUND_WINDOW;
             save_project_state(&env, project_id, &state);
             panic_with_error!(&env, Error::ProjectExpired);
         }
@@ -457,6 +614,7 @@ impl PifpProtocol {
             ProjectStatus::Funding | ProjectStatus::Active => {}
             ProjectStatus::Completed => panic_with_error!(&env, Error::MilestoneAlreadyReleased),
             ProjectStatus::Expired => panic_with_error!(&env, Error::ProjectExpired),
+            ProjectStatus::Cancelled => panic_with_error!(&env, Error::InvalidTransition),
         }
 
         // Mocked ZK verification: compare submitted hash to stored hash.
@@ -470,18 +628,50 @@ impl PifpProtocol {
         // Transfer all deposited tokens to the creator.
         // If any transfer fails, panic to revert the entire transaction.
         let contract_address = env.current_contract_address();
+        let protocol_config = get_protocol_config(&env);
+
         for token in config.accepted_tokens.iter() {
             // Drain the token balance (gets balance and zeros it).
-            let balance = drain_token_balance(&env, project_id, &token);
+            let mut balance = drain_token_balance(&env, project_id, &token);
 
             // Only transfer if there's a non-zero balance.
             if balance > 0 {
-                // Create token client and transfer to creator.
                 let token_client = token::Client::new(&env, &token);
-                token_client.transfer(&contract_address, &config.creator, &balance);
 
-                // Emit funds_released event for this token.
-                events::emit_funds_released(&env, project_id, token, balance);
+                // Deduct platform fee if configured.
+                if let Some(config) = &protocol_config {
+                    if config.fee_bps > 0 {
+                        // fee = balance * bps / 10000
+                        let fee_amount = balance
+                            .checked_mul(config.fee_bps as i128)
+                            .unwrap_or(0)
+                            .checked_div(10000)
+                            .unwrap_or(0);
+
+                        if fee_amount > 0 {
+                            token_client.transfer(
+                                &contract_address,
+                                &config.fee_recipient,
+                                &fee_amount,
+                            );
+                            balance = balance.checked_sub(fee_amount).unwrap_or(balance);
+                            events::emit_fee_deducted(
+                                &env,
+                                project_id,
+                                token.clone(),
+                                fee_amount,
+                                config.fee_recipient.clone(),
+                            );
+                        }
+                    }
+                }
+
+                // Transfer remaining to creator.
+                if balance > 0 {
+                    token_client.transfer(&contract_address, &config.creator, &balance);
+                    // Emit funds_released event for this token.
+                    events::emit_funds_released(&env, project_id, token, balance);
+                }
             }
         }
 
@@ -514,10 +704,63 @@ impl PifpProtocol {
 
         // Update status and save.
         state.status = ProjectStatus::Expired;
+        state.refund_expiry = env.ledger().timestamp() + REFUND_WINDOW;
         save_project_state(&env, project_id, &state);
 
         // Standardized event emission.
         events::emit_project_expired(&env, project_id, config.deadline);
+    }
+
+    // ─────────────────────────────────────────────────────────
+    // Donor Refund Expiry
+    // ─────────────────────────────────────────────────────────
+
+    /// Reclaim unclaimed donor funds after the 6-month refund window has expired.
+    ///
+    /// Only the project creator may call this, and only for projects that are
+    /// `Expired` or `Cancelled` whose `refund_expiry` timestamp has passed.
+    /// For each accepted token, any remaining balance is transferred to the creator.
+    pub fn reclaim_expired_funds(env: Env, creator: Address, project_id: u64) {
+        Self::require_not_paused(&env);
+        creator.require_auth();
+
+        let (config, state) = load_project_pair(&env, project_id);
+
+        // Only the project creator may reclaim.
+        if creator != config.creator {
+            panic_with_error!(&env, Error::NotAuthorized);
+        }
+
+        // Project must be in a terminal refundable state.
+        if !matches!(
+            state.status,
+            ProjectStatus::Expired | ProjectStatus::Cancelled
+        ) {
+            panic_with_error!(&env, Error::InvalidTransition);
+        }
+
+        // The refund window must have expired.
+        if state.refund_expiry == 0 || env.ledger().timestamp() < state.refund_expiry {
+            panic_with_error!(&env, Error::RefundWindowActive);
+        }
+
+        // Drain remaining balances for each accepted token.
+        let contract_address = env.current_contract_address();
+        for token in config.accepted_tokens.iter() {
+            let balance = drain_token_balance(&env, project_id, &token);
+            if balance > 0 {
+                let token_client = token::Client::new(&env, &token);
+                token_client.transfer(&contract_address, &config.creator, &balance);
+
+                events::emit_expired_funds_reclaimed(
+                    &env,
+                    project_id,
+                    config.creator.clone(),
+                    token,
+                    balance,
+                );
+            }
+        }
     }
 
     // ─────────────────────────────────────────────────────────

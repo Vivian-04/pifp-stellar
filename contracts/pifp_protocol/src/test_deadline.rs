@@ -24,6 +24,7 @@ fn test_extend_deadline_success() {
         &1000,
         &[0u8; 32].into(),
         &deadline,
+        &deadline, &false,
     );
     
     let new_deadline = deadline + 5000;
@@ -52,6 +53,7 @@ fn test_extend_deadline_by_admin() {
         &1000,
         &[0u8; 32].into(),
         &deadline,
+        &deadline, &false,
     );
     
     let new_deadline = deadline + 5000;
@@ -79,6 +81,7 @@ fn test_extend_deadline_unauthorized() {
         &1000,
         &[0u8; 32].into(),
         &(env.ledger().timestamp() + 10000),
+        &(env.ledger().timestamp() + 10000), &false,
     );
     
     client.extend_deadline(&stranger, &project.id, &(env.ledger().timestamp() + 15000));
@@ -101,6 +104,7 @@ fn test_extend_deadline_backwards() {
         &1000,
         &[0u8; 32].into(),
         &deadline,
+        &deadline, &false,
     );
     
     // New deadline same as or earlier than current is Error::InvalidDeadline (13)
@@ -127,6 +131,7 @@ fn test_extend_deadline_expired() {
         &1000,
         &[0u8; 32].into(),
         &deadline,
+        &deadline, &false,
     );
     
     // Fast forward past deadline
@@ -155,6 +160,7 @@ fn test_extend_deadline_too_long() {
         &1000,
         &[0u8; 32].into(),
         &deadline,
+        &deadline, &false,
     );
     
     // 1 year + 1 second
